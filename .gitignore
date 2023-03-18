@@ -8,6 +8,8 @@ _obj
 _test
 release
 debian
+bin
+dist/
 
 # Architecture specific extensions/prefixes
 *.[568vq]
@@ -21,10 +23,13 @@ _cgo_export.*
 
 _testmain.go
 
+*.swp
+*.swo
+
 *.exe
 *.test
 
 *.bak
 
+.vscode/
 cmd/gost/gost
-snap

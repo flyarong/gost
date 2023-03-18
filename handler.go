@@ -7,8 +7,8 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/ginuerzh/gosocks4"
-	"github.com/ginuerzh/gosocks5"
+	"github.com/go-gost/gosocks4"
+	"github.com/go-gost/gosocks5"
 	"github.com/go-log/log"
 )
 
@@ -40,6 +40,10 @@ type HandlerOptions struct {
 	Node          Node
 	Host          string
 	IPs           []string
+	TCPMode       bool
+	IPRoutes      []IPRoute
+	ProxyAgent    string
+	HTTPTunnel    bool
 }
 
 // HandlerOption allows a common way to set handler options.
@@ -192,6 +196,34 @@ func HostHandlerOption(host string) HandlerOption {
 func IPsHandlerOption(ips []string) HandlerOption {
 	return func(opts *HandlerOptions) {
 		opts.IPs = ips
+	}
+}
+
+// TCPModeHandlerOption sets the tcp mode for tun/tap device.
+func TCPModeHandlerOption(b bool) HandlerOption {
+	return func(opts *HandlerOptions) {
+		opts.TCPMode = b
+	}
+}
+
+// IPRoutesHandlerOption sets the IP routes for tun tunnel.
+func IPRoutesHandlerOption(routes ...IPRoute) HandlerOption {
+	return func(opts *HandlerOptions) {
+		opts.IPRoutes = routes
+	}
+}
+
+// ProxyAgentHandlerOption sets the proxy agent for http handler.
+func ProxyAgentHandlerOption(agent string) HandlerOption {
+	return func(opts *HandlerOptions) {
+		opts.ProxyAgent = agent
+	}
+}
+
+// HTTPTunnelHandlerOption sets the Tunnel mode for HTTP client used in HTTP handler.
+func HTTPTunnelHandlerOption(tunnelMode bool) HandlerOption {
+	return func(opts *HandlerOptions) {
+		opts.HTTPTunnel = tunnelMode
 	}
 }
 

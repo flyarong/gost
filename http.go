@@ -3,6 +3,7 @@ package gost
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"net"
@@ -27,7 +28,16 @@ func HTTPConnector(user *url.Userinfo) Connector {
 	return &httpConnector{User: user}
 }
 
-func (c *httpConnector) Connect(conn net.Conn, addr string, options ...ConnectOption) (net.Conn, error) {
+func (c *httpConnector) Connect(conn net.Conn, address string, options ...ConnectOption) (net.Conn, error) {
+	return c.ConnectContext(context.Background(), conn, "tcp", address, options...)
+}
+
+func (c *httpConnector) ConnectContext(ctx context.Context, conn net.Conn, network, address string, options ...ConnectOption) (net.Conn, error) {
+	switch network {
+	case "udp", "udp4", "udp6":
+		return nil, fmt.Errorf("%s unsupported", network)
+	}
+
 	opts := &ConnectOptions{}
 	for _, option := range options {
 		option(opts)
@@ -47,8 +57,8 @@ func (c *httpConnector) Connect(conn net.Conn, addr string, options ...ConnectOp
 
 	req := &http.Request{
 		Method:     http.MethodConnect,
-		URL:        &url.URL{Host: addr},
-		Host:       addr,
+		URL:        &url.URL{Host: address},
+		Host:       address,
 		ProtoMajor: 1,
 		ProtoMinor: 1,
 		Header:     make(http.Header),
@@ -163,7 +173,12 @@ func (h *httpHandler) handleRequest(conn net.Conn, req *http.Request) {
 		ProtoMinor: 1,
 		Header:     http.Header{},
 	}
-	resp.Header.Add("Proxy-Agent", "gost/"+Version)
+
+	proxyAgent := DefaultProxyAgent
+	if h.options.ProxyAgent != "" {
+		proxyAgent = h.options.ProxyAgent
+	}
+	resp.Header.Add("Proxy-Agent", proxyAgent)
 
 	if !Can("tcp", host, h.options.Whitelist, h.options.Blacklist) {
 		log.Logf("[http] %s - %s : Unauthorized to tcp connect to %s",
@@ -242,7 +257,9 @@ func (h *httpHandler) handleRequest(conn net.Conn, req *http.Request) {
 
 		// forward http request
 		lastNode := route.LastNode()
-		if req.Method != http.MethodConnect && lastNode.Protocol == "http" {
+		if req.Method != http.MethodConnect &&
+			lastNode.Protocol == "http" &&
+			!h.options.HTTPTunnel {
 			err = h.forwardRequest(conn, req, route)
 			if err == nil {
 				return
@@ -277,7 +294,7 @@ func (h *httpHandler) handleRequest(conn net.Conn, req *http.Request) {
 
 	if req.Method == http.MethodConnect {
 		b := []byte("HTTP/1.1 200 Connection established\r\n" +
-			"Proxy-Agent: gost/" + Version + "\r\n\r\n")
+			"Proxy-Agent: " + proxyAgent + "\r\n\r\n")
 		if Debug {
 			log.Logf("[http] %s <- %s\n%s", conn.RemoteAddr(), conn.LocalAddr(), string(b))
 		}
@@ -353,6 +370,12 @@ func (h *httpHandler) authenticate(conn net.Conn, req *http.Request, resp *http.
 			conn.RemoteAddr(), conn.LocalAddr())
 		resp.StatusCode = http.StatusProxyAuthRequired
 		resp.Header.Add("Proxy-Authenticate", "Basic realm=\"gost\"")
+		if strings.ToLower(req.Header.Get("Proxy-Connection")) == "keep-alive" {
+			// XXX libcurl will keep sending auth request in same conn
+			// which we don't supported yet.
+			resp.Header.Add("Connection", "close")
+			resp.Header.Add("Proxy-Connection", "close")
+		}
 	} else {
 		resp.Header = http.Header{}
 		resp.Header.Set("Server", "nginx/1.14.1")
@@ -376,7 +399,15 @@ func (h *httpHandler) forwardRequest(conn net.Conn, req *http.Request, route *Ch
 	if route.IsEmpty() {
 		return nil
 	}
-	lastNode := route.LastNode()
+
+	host := req.Host
+	var userpass string
+
+	if user := route.LastNode().User; user != nil {
+		u := user.Username()
+		p, _ := user.Password()
+		userpass = base64.StdEncoding.EncodeToString([]byte(u + ":" + p))
+	}
 
 	cc, err := route.Conn()
 	if err != nil {
@@ -384,28 +415,47 @@ func (h *httpHandler) forwardRequest(conn net.Conn, req *http.Request, route *Ch
 	}
 	defer cc.Close()
 
-	if lastNode.User != nil {
-		s := lastNode.User.String()
-		if _, set := lastNode.User.Password(); !set {
-			s += ":"
+	errc := make(chan error, 1)
+	go func() {
+		errc <- copyBuffer(conn, cc)
+	}()
+
+	go func() {
+		for {
+			if userpass != "" {
+				req.Header.Set("Proxy-Authorization", "Basic "+userpass)
+			}
+
+			cc.SetWriteDeadline(time.Now().Add(WriteTimeout))
+			if !req.URL.IsAbs() {
+				req.URL.Scheme = "http" // make sure that the URL is absolute
+			}
+			err := req.WriteProxy(cc)
+			if err != nil {
+				log.Logf("[http] %s -> %s : %s", conn.RemoteAddr(), conn.LocalAddr(), err)
+				errc <- err
+				return
+			}
+			cc.SetWriteDeadline(time.Time{})
+
+			req, err = http.ReadRequest(bufio.NewReader(conn))
+			if err != nil {
+				errc <- err
+				return
+			}
+
+			if Debug {
+				dump, _ := httputil.DumpRequest(req, false)
+				log.Logf("[http] %s -> %s\n%s",
+					conn.RemoteAddr(), conn.LocalAddr(), string(dump))
+			}
 		}
-		req.Header.Set("Proxy-Authorization",
-			"Basic "+base64.StdEncoding.EncodeToString([]byte(s)))
-	}
+	}()
 
-	cc.SetWriteDeadline(time.Now().Add(WriteTimeout))
-	if !req.URL.IsAbs() {
-		req.URL.Scheme = "http" // make sure that the URL is absolute
-	}
-	if err = req.WriteProxy(cc); err != nil {
-		log.Logf("[http] %s -> %s : %s", conn.RemoteAddr(), conn.LocalAddr(), err)
-		return nil
-	}
-	cc.SetWriteDeadline(time.Time{})
+	log.Logf("[http] %s <-> %s", conn.RemoteAddr(), host)
+	<-errc
+	log.Logf("[http] %s >-< %s", conn.RemoteAddr(), host)
 
-	log.Logf("[http] %s <-> %s", conn.RemoteAddr(), req.Host)
-	transport(conn, cc)
-	log.Logf("[http] %s >-< %s", conn.RemoteAddr(), req.Host)
 	return nil
 }
 
